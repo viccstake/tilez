@@ -1,167 +1,371 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-use std::thread;
+use clap::{ArgAction, Parser};
+use seb_mul_game::logger::Logger;
+use std::fmt;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
-struct Player {
-    stream: TcpStream,
-    reader: BufReader<TcpStream>,
-    symbol: char,
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+#[command(
+    name    = "server",
+    version,
+    about   = "Seb n Vic Multiplayer Game — dedicated server",
+    long_about = "Accepts pairs of TCP clients and runs authoritative game sessions.\n\
+                  Protocol is line-delimited UTF-8; see src/bin/server.rs for the full spec."
+)]
+struct Args {
+    /// Address to listen on
+    #[arg(short, long, default_value = "0.0.0.0:7878")]
+    bind: String,
+
+    /// Increase output verbosity (-v verbose, -vv debug, -vvv trace)
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+
+    /// Maximum number of games that can run concurrently
+    #[arg(short = 'g', long, default_value_t = 16)]
+    max_games: u32,
 }
 
-impl Player {
-    fn new(stream: TcpStream, symbol: char) -> std::io::Result<Self> {
-        let reader = BufReader::new(stream.try_clone()?);
-        Ok(Player { stream, reader, symbol })
-    }
+// ── DISPLAY EVENTS ────────────────────────────────────────────────────────────
+//
+// Every loggable occurrence is an `Event` variant.  Implementing `Display`
+// here means the logger receives a rich, human-readable message while still
+// using Rust's zero-cost formatting machinery (no allocation until a variant
+// is actually emitted at the current verbosity level).
 
-    fn send(&mut self, msg: &str) {
-        let _ = self.stream.write_all(msg.as_bytes());
-        let _ = self.stream.flush();
-    }
+enum Event {
+    Listening      { addr: String },
+    WaitingForPair { game_id: u32 },
+    PlayerConnected { n: u8, game_id: u32, addr: SocketAddr },
+    GameStarted    { game_id: u32 },
+    GameEnded      { game_id: u32 },
+    PlayerMsg      { game_id: u32, player: u8, msg: String },
+    PlayerDisconnected { game_id: u32, player: u8 },
+    InvalidCmd     { game_id: u32, player: u8, raw: String },
+    AcceptError    { reason: String },
+    SlotsFull,
+}
 
-    fn recv(&mut self) -> Option<String> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line.trim().to_string()),
+impl fmt::Display for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Event::Listening { addr } =>
+                write!(f, "Server listening on {addr}"),
+            Event::WaitingForPair { game_id } =>
+                write!(f, "[game {game_id}] Waiting for two players to connect"),
+            Event::PlayerConnected { n, game_id, addr } =>
+                write!(f, "[game {game_id}] Player {n} connected from {addr}"),
+            Event::GameStarted { game_id } =>
+                write!(f, "[game {game_id}] Game started"),
+            Event::GameEnded { game_id } =>
+                write!(f, "[game {game_id}] Game ended"),
+            Event::PlayerMsg { game_id, player, msg } =>
+                write!(f, "[game {game_id}] P{player} → {msg}"),
+            Event::PlayerDisconnected { game_id, player } =>
+                write!(f, "[game {game_id}] Player {player} disconnected"),
+            Event::InvalidCmd { game_id, player, raw } =>
+                write!(f, "[game {game_id}] P{player} sent unrecognised command: {raw:?}"),
+            Event::AcceptError { reason } =>
+                write!(f, "Accept error: {reason}"),
+            Event::SlotsFull =>
+                write!(f, "Max concurrent games reached — new connections will queue"),
         }
     }
 }
 
-fn board_display(board: &[char; 9]) -> String {
-    let c = |i: usize| {
-        if board[i] == ' ' {
-            char::from_digit(i as u32, 10).unwrap()
-        } else {
-            board[i]
-        }
-    };
-    format!(
-        " {} | {} | {}\n---+---+---\n {} | {} | {}\n---+---+---\n {} | {} | {}",
-        c(0), c(1), c(2),
-        c(3), c(4), c(5),
-        c(6), c(7), c(8),
-    )
+// ── PROTOCOL SPEC ─────────────────────────────────────────────────────────────
+//
+// Client → Server (one line per message):
+//   PLACE <x> <y> <radius>
+//   SHOOT <piece_index> <dx> <dy> <force>
+//
+// Server → Client (one line per message):
+//   WAITING                — holding for second player
+//   READY <player_id>      — game begins; your id is 0 or 1
+//   YOUR_TURN
+//   OPPONENT_TURN
+//   OK                     — move accepted
+//   ERROR <reason>         — move rejected; try again
+//   STATE <n> [<owner> <x> <y> <r>]×n
+//   DISCONNECTED           — opponent left; game over
+
+// ── CLIENT COMMANDS ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum ClientCmd {
+    Place { x: f32, y: f32, radius: f32 },
+    Shoot { index: usize, dx: f32, dy: f32, force: f32 },
 }
 
-fn check_winner(board: &[char; 9]) -> Option<char> {
-    const WINS: [[usize; 3]; 8] = [
-        [0, 1, 2], [3, 4, 5], [6, 7, 8],
-        [0, 3, 6], [1, 4, 7], [2, 5, 8],
-        [0, 4, 8], [2, 4, 6],
-    ];
-    for combo in &WINS {
-        let c = board[combo[0]];
-        if c != ' ' && c == board[combo[1]] && c == board[combo[2]] {
-            return Some(c);
+impl ClientCmd {
+    fn parse(line: &str) -> Option<Self> {
+        let mut t = line.split_whitespace();
+        match t.next()? {
+            "PLACE" => Some(Self::Place {
+                x:      t.next()?.parse().ok()?,
+                y:      t.next()?.parse().ok()?,
+                radius: t.next()?.parse().ok()?,
+            }),
+            "SHOOT" => Some(Self::Shoot {
+                index: t.next()?.parse().ok()?,
+                dx:    t.next()?.parse().ok()?,
+                dy:    t.next()?.parse().ok()?,
+                force: t.next()?.parse().ok()?,
+            }),
+            _ => None,
         }
     }
-    None
 }
 
-fn run_game(players: &mut [Player; 2]) {
-    let mut board = [' '; 9];
-    let mut current = 0usize; // 0 = X, 1 = O
+// ── AUTHORITATIVE GAME STATE ──────────────────────────────────────────────────
 
-    let position_hint = concat!(
-        "Board positions:\n",
-        " 0 | 1 | 2\n",
-        "---+---+---\n",
-        " 3 | 4 | 5\n",
-        "---+---+---\n",
-        " 6 | 7 | 8\n\n",
-    );
+#[derive(Clone)]
+struct Piece {
+    owner:  u8,
+    x:      f32,
+    y:      f32,
+    radius: f32,
+}
 
-    players[0].send(&format!(
-        "Opponent connected! You are X. You go first.\n{position_hint}"
-    ));
-    players[1].send(&format!(
-        "Opponent connected! You are O. X goes first.\n{position_hint}"
-    ));
+/// Piece serialises as `<owner> <x> <y> <radius>` — embedded directly into
+/// the `STATE` line that is broadcast to both players after every move.
+impl fmt::Display for Piece {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {:.3} {:.3} {:.3}", self.owner, self.x, self.y, self.radius)
+    }
+}
 
-    loop {
-        let display = format!("\n{}\n\n", board_display(&board));
-        players[0].send(&display);
-        players[1].send(&display);
+struct GameState {
+    pieces: Vec<Piece>,
+    turn:   u8,     // 0 or 1
+}
 
-        if let Some(winner) = check_winner(&board) {
-            let msg = format!("Player {winner} wins!\n");
-            players[0].send(&msg);
-            players[1].send(&msg);
-            let wi = if players[0].symbol == winner { 0 } else { 1 };
-            players[wi].send("You WIN! Congratulations!\n");
-            players[1 - wi].send("You lose. Better luck next time!\n");
-            break;
+impl GameState {
+    fn new() -> Self {
+        Self { pieces: Vec::new(), turn: 0 }
+    }
+
+    /// Full board serialised as a server message ready to write to a socket.
+    fn state_line(&self) -> String {
+        let body: Vec<String> = self.pieces.iter().map(|p| p.to_string()).collect();
+        format!("STATE {} {}\n", self.pieces.len(), body.join(" "))
+    }
+
+    fn place(&mut self, owner: u8, x: f32, y: f32, radius: f32) -> Result<(), &'static str> {
+        if owner != self.turn {
+            return Err("not your turn");
         }
-
-        if board.iter().all(|&c| c != ' ') {
-            players[0].send("It's a DRAW!\n");
-            players[1].send("It's a DRAW!\n");
-            break;
+        if radius <= 0.0 {
+            return Err("radius must be positive");
         }
-
-        // Get move from current player
-        let (first, second) = players.split_at_mut(1);
-        let (cur, other) = if current == 0 {
-            (&mut first[0], &mut second[0])
-        } else {
-            (&mut second[0], &mut first[0])
-        };
-
-        other.send(&format!("Waiting for {} to move...\n", cur.symbol));
-
-        loop {
-            cur.send("YOUR_TURN\n");
-            match cur.recv() {
-                None => {
-                    other.send("Opponent disconnected. Game over.\n");
-                    return;
-                }
-                Some(line) => match line.trim().parse::<usize>() {
-                    Ok(pos) if pos < 9 && board[pos] == ' ' => {
-                        board[pos] = cur.symbol;
-                        break;
-                    }
-                    Ok(pos) if pos < 9 => {
-                        cur.send(&format!("Position {pos} is already taken. Try again:\n"));
-                    }
-                    _ => {
-                        cur.send("Invalid input. Enter a number 0-8:\n");
-                    }
-                },
+        for p in &self.pieces {
+            let dist = ((p.x - x).powi(2) + (p.y - y).powi(2)).sqrt();
+            if dist < p.radius + radius {
+                return Err("overlaps an existing piece");
             }
         }
+        self.pieces.push(Piece { owner, x, y, radius });
+        self.turn = 1 - self.turn;
+        Ok(())
+    }
 
-        current = 1 - current;
+    fn shoot(
+        &mut self,
+        owner: u8,
+        index: usize,
+        dx: f32,
+        dy: f32,
+        force: f32,
+    ) -> Result<(), &'static str> {
+        if owner != self.turn {
+            return Err("not your turn");
+        }
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < f32::EPSILON {
+            return Err("direction vector must be non-zero");
+        }
+        let piece = self.pieces.get(index).ok_or("piece index out of range")?;
+        if piece.owner != owner {
+            return Err("that piece does not belong to you");
+        }
+        let p = &mut self.pieces[index];
+        p.x += (dx / len) * force;
+        p.y += (dy / len) * force;
+        self.turn = 1 - self.turn;
+        Ok(())
     }
 }
 
-fn main() {
-    let addr = "0.0.0.0:7878";
-    let listener = TcpListener::bind(addr).expect("Failed to bind to port 7878");
-    println!("=== Tic Tac Toe Server ===");
-    println!("Listening on {addr}");
+// ── PER-GAME SESSION ──────────────────────────────────────────────────────────
+
+async fn run_game(
+    s1: TcpStream,
+    a1: SocketAddr,
+    s2: TcpStream,
+    a2: SocketAddr,
+    game_id: u32,
+    log: Arc<Logger>,
+) {
+    log.info(Event::PlayerConnected { n: 1, game_id, addr: a1 });
+    log.info(Event::PlayerConnected { n: 2, game_id, addr: a2 });
+    log.info(Event::GameStarted { game_id });
+
+    let (r1, mut w1) = tokio::io::split(s1);
+    let (r2, mut w2) = tokio::io::split(s2);
+    let mut lines1 = BufReader::new(r1).lines();
+    let mut lines2 = BufReader::new(r2).lines();
+
+    // Announce game start and initial turn order.
+    let _ = w1.write_all(b"READY 0\nYOUR_TURN\n").await;
+    let _ = w2.write_all(b"READY 1\nOPPONENT_TURN\n").await;
+
+    let mut state = GameState::new();
 
     loop {
-        println!("\nWaiting for 2 players to connect...");
+        // Poll both streams; whichever produces a line first wins this tick.
+        // tokio::select! is cancellation-safe here: BufReader preserves any
+        // partially buffered data if a branch is dropped.
+        let (line, player) = tokio::select! {
+            res = lines1.next_line() => match res {
+                Ok(Some(l)) => (l, 0u8),
+                _ => {
+                    log.info(Event::PlayerDisconnected { game_id, player: 0 });
+                    let _ = w2.write_all(b"DISCONNECTED\n").await;
+                    break;
+                }
+            },
+            res = lines2.next_line() => match res {
+                Ok(Some(l)) => (l, 1u8),
+                _ => {
+                    log.info(Event::PlayerDisconnected { game_id, player: 1 });
+                    let _ = w1.write_all(b"DISCONNECTED\n").await;
+                    break;
+                }
+            },
+        };
 
-        let (mut s1, a1) = listener.accept().expect("Accept failed");
-        println!("Player 1 (X) connected from {a1}");
-        let _ = s1.write_all(b"Connected! Waiting for second player...\n");
-        let _ = s1.flush();
+        let trimmed = line.trim().to_string();
+        log.verbose(Event::PlayerMsg { game_id, player, msg: trimmed.clone() });
 
-        let (mut s2, a2) = listener.accept().expect("Accept failed");
-        println!("Player 2 (O) connected from {a2}");
-        let _ = s2.write_all(b"Second player connected!\n");
-        let _ = s2.flush();
+        // Reject out-of-turn messages without advancing state.
+        if player != state.turn {
+            let reply = format!("ERROR not your turn\n");
+            let w = if player == 0 { &mut w1 } else { &mut w2 };
+            let _ = w.write_all(reply.as_bytes()).await;
+            continue;
+        }
 
-        thread::spawn(move || {
-            let mut players = match (Player::new(s1, 'X'), Player::new(s2, 'O')) {
-                (Ok(p1), Ok(p2)) => [p1, p2],
-                _ => return,
-            };
-            run_game(&mut players);
-            println!("A game has ended.");
+        let result = match ClientCmd::parse(&trimmed) {
+            Some(ClientCmd::Place { x, y, radius }) => {
+                log.debug(format!("[game {game_id}] P{player} PLACE x={x:.3} y={y:.3} r={radius:.3}"));
+                state.place(player, x, y, radius)
+            }
+            Some(ClientCmd::Shoot { index, dx, dy, force }) => {
+                log.debug(format!("[game {game_id}] P{player} SHOOT #{index} dir=({dx:.3},{dy:.3}) force={force:.3}"));
+                state.shoot(player, index, dx, dy, force)
+            }
+            None => {
+                log.warn(Event::InvalidCmd { game_id, player, raw: trimmed.clone() });
+                Err("unrecognised command")
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                let state_msg = state.state_line();
+                log.trace(format!("[game {game_id}] {state_msg}"));
+                let _ = w1.write_all(b"OK\n").await;
+                let _ = w2.write_all(b"OK\n").await;
+                let _ = w1.write_all(state_msg.as_bytes()).await;
+                let _ = w2.write_all(state_msg.as_bytes()).await;
+                // Signal the new active player.
+                if state.turn == 0 {
+                    let _ = w1.write_all(b"YOUR_TURN\n").await;
+                    let _ = w2.write_all(b"OPPONENT_TURN\n").await;
+                } else {
+                    let _ = w1.write_all(b"OPPONENT_TURN\n").await;
+                    let _ = w2.write_all(b"YOUR_TURN\n").await;
+                }
+            }
+            Err(reason) => {
+                let err = format!("ERROR {reason}\n");
+                let w = if player == 0 { &mut w1 } else { &mut w2 };
+                let _ = w.write_all(err.as_bytes()).await;
+            }
+        }
+    }
+
+    log.info(Event::GameEnded { game_id });
+}
+
+// ── ENTRY POINT ───────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+    let log  = Arc::new(Logger::new(args.verbose));
+
+    let max_games = args.max_games.max(1) as usize;
+    let slots = Arc::new(Semaphore::new(max_games));
+
+    let listener = TcpListener::bind(&args.bind).await.unwrap_or_else(|e| {
+        eprintln!("Failed to bind to {}: {e}", args.bind);
+        std::process::exit(1);
+    });
+
+    log.info(Event::Listening { addr: args.bind.clone() });
+    log.verbose(format!("Max concurrent games: {max_games}"));
+
+    let game_counter = Arc::new(AtomicU32::new(0));
+
+    loop {
+        // Acquire a game slot before accepting connections.
+        // When every slot is occupied the loop pauses here,
+        // naturally back-pressuring new TCP connections.
+        let permit = match Arc::clone(&slots).acquire_owned().await {
+            Ok(p)  => p,
+            Err(_) => break,
+        };
+
+        let game_id = game_counter.fetch_add(1, Ordering::Relaxed);
+        log.verbose(Event::WaitingForPair { game_id });
+
+        // Accept first player and tell them to hold.
+        let (mut s1, a1) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e)   => {
+                log.warn(Event::AcceptError { reason: e.to_string() });
+                drop(permit);
+                continue;
+            }
+        };
+        let _ = s1.write_all(b"WAITING\n").await;
+
+        if slots.available_permits() == 0 {
+            log.verbose(Event::SlotsFull);
+        }
+
+        // Accept second player.
+        let (s2, a2) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e)   => {
+                log.warn(Event::AcceptError { reason: e.to_string() });
+                drop(permit);
+                continue;
+            }
+        };
+
+        let log_task = Arc::clone(&log);
+        tokio::spawn(async move {
+            // Permit is held for the lifetime of the game task.
+            let _permit = permit;
+            run_game(s1, a1, s2, a2, game_id, log_task).await;
         });
     }
 }

@@ -1,5 +1,5 @@
 fn main() {
-    println!("Tic Tac Toe - 2 Player Network Game");
+    println!("Seb n Vic Multiplayer Game ™");
     println!();
     println!("Usage:");
     println!("  Start the server:   cargo run --bin server");

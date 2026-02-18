@@ -1,6 +1,17 @@
 [package]
-name = "seb-mul-game"
+name    = "seb-mul-game"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# The "game" feature pulls in Bevy for client-side rendering and physics.
+# It is NOT required to build or run the dedicated server.
+#
+#   Build server only:          cargo build --bin server
+#   Build full game (+ Bevy):   cargo build --features game
+game = ["dep:bevy"]
+
 [dependencies]
+bevy  = { version = "0.18.0", optional = true }
+clap  = { version = "4", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["full"] }

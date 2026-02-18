@@ -11,3 +11,44 @@
 
   # To connect from another machine:
   cargo run --bin client 192.168.x.x:7878
+
+  
+  ┌───────────────────┬────────────────────────────────────────────────────────────────────┐
+  │       File        │                           Responsibility                           │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ src/game.rs       │ Board struct — cell state, move validation, win detection, display │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ src/player.rs     │ Player struct — TCP stream wrapper with send / recv                │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ src/session.rs    │ run_game — game loop, turn coordination, win/draw announcements    │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ src/lib.rs        │ Declares the three modules for use by binaries                     │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ src/bin/server.rs │ Entry point — bind, accept pairs, spawn threads                    │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ src/bin/client.rs │ Entry point — connect, read/write loop                             │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ src/main.rs       │ Entry point — prints usage                                         │
+  └───────────────────┴────────────────────────────────────────────────────────────────────┘
+
+
+  ┌──────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+  │        Piece         │                                     What it does                                     │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Args (clap)          │ --bind, --verbose (stackable), --max-games                                           │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Event enum + Display │ Every loggable thing is a typed value — no ad-hoc strings                            │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ ClientCmd::parse     │ Parses PLACE x y r and SHOOT idx dx dy force                                         │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ GameState + Piece    │ Authoritative server-side board; Piece implements Display for the STATE wire message │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ run_game             │ Async per-pair task; tokio::select! polls both players simultaneously                │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Semaphore            │ --max-games enforced; excess connections queue naturally                             │
+  └──────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+  
+Build commands:
+  cargo build --bin server          # server only (no Bevy needed)
+  cargo build --features game       # full crate including Bevy ECS module
+  ./target/debug/server -vvv        # run with full trace logging
