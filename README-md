@@ -1,0 +1,13 @@
+ How to play:
+
+  # Terminal 1 — start the server
+  cargo run --bin server
+
+  # Terminal 2 — Player 1 connects
+  cargo run --bin client
+
+  # Terminal 3 — Player 2 connects
+  cargo run --bin client
+
+  # To connect from another machine:
+  cargo run --bin client 192.168.x.x:7878
