@@ -1,371 +1,253 @@
-use clap::{ArgAction, Parser};
-use seb_mul_game::logger::Logger;
-use std::fmt;
-use std::io::{self, Write as _};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+use bevy::prelude::*;
+use clap::Parser;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+
+use naval_game::game::components::{Health, Position, Ship, ShipId};
+use naval_game::game::hex::Hex;
+use naval_game::game::resources::{CurrentTurn, OrderQueue};
+use naval_game::game::state::GameState;
+use naval_game::game::systems::input;
+use naval_game::protocol::{ClientMessage, GameSnapshot, ServerMessage};
+use naval_game::session::Session;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
-#[derive(Parser, Debug)]
-#[command(
-    name    = "client",
-    version,
-    about   = "Seb n Vic Multiplayer Game — terminal client",
-    long_about = "Connects to a running game server and plays interactively.\n\
-                  Commands (type when it is your turn):\n  \
-                    place <x> <y> <radius>\n  \
-                    shoot <piece#> <dx> <dy> <force>"
-)]
+#[derive(Parser)]
+#[command(name = "client")]
 struct Args {
-    /// Server address to connect to
+    /// Server address
     #[arg(default_value = "127.0.0.1:7878")]
-    addr: String,
+    server: String,
 
-    /// Increase output verbosity (-v verbose, -vv debug, -vvv trace)
-    #[arg(short, long, action = ArgAction::Count)]
-    verbose: u8,
+    /// Player name
+    #[arg(short, long, default_value = "Player")]
+    name: String,
 }
 
-// ── CLIENT EVENTS (operational logging to stderr) ─────────────────────────────
+// ── Networking resources ──────────────────────────────────────────────────────
 
-enum ClientEvent<'a> {
-    Connecting { addr: &'a str },
-    Connected  { addr: &'a str },
-    Sending    { cmd: &'a str },
-    Received   { raw: &'a str },
-    Disconnected,
-}
+/// Inbound channel: server → Bevy. Wrapped in Mutex to satisfy Sync.
+#[derive(Resource)]
+struct NetRx(Mutex<mpsc::UnboundedReceiver<ServerMessage>>);
 
-impl fmt::Display for ClientEvent<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ClientEvent::Connecting { addr }  => write!(f, "Connecting to {addr}…"),
-            ClientEvent::Connected  { addr }  => write!(f, "Connected to {addr}"),
-            ClientEvent::Sending    { cmd }   => write!(f, "→ {cmd}"),
-            ClientEvent::Received   { raw }   => write!(f, "← {raw}"),
-            ClientEvent::Disconnected         => write!(f, "Connection closed by server"),
-        }
-    }
-}
+/// Outbound channel: Bevy → server.
+#[derive(Resource)]
+struct NetTx(mpsc::UnboundedSender<ClientMessage>);
 
-// ── BOARD STATE ───────────────────────────────────────────────────────────────
+#[derive(Resource, Default)]
+struct LocalPlayerId(Option<u32>);
 
-#[derive(Clone)]
-struct Piece {
-    index:  usize,
-    owner:  u8,
-    x:      f32,
-    y:      f32,
-    radius: f32,
-}
+/// Maps server ship ID → Bevy entity so snapshots update entities in place.
+#[derive(Resource, Default)]
+struct ShipEntities(HashMap<u32, Entity>);
 
-struct BoardState {
-    pieces: Vec<Piece>,
-}
+// ── Entry point ───────────────────────────────────────────────────────────────
 
-impl BoardState {
-    /// Parse the payload after `STATE <n> `.
-    fn parse(line: &str) -> Option<Self> {
-        let mut t = line.split_whitespace();
-        let n: usize = t.next()?.parse().ok()?;
-        let mut pieces = Vec::with_capacity(n);
-        for index in 0..n {
-            pieces.push(Piece {
-                index,
-                owner:  t.next()?.parse().ok()?,
-                x:      t.next()?.parse().ok()?,
-                y:      t.next()?.parse().ok()?,
-                radius: t.next()?.parse().ok()?,
-            });
-        }
-        Some(Self { pieces })
-    }
-}
-
-/// Piece renders as a compact single-line summary.
-impl fmt::Display for Piece {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "  #{:<2}  P{}  pos=({:>8.2}, {:>8.2})  radius={:.2}",
-            self.index, self.owner, self.x, self.y, self.radius
-        )
-    }
-}
-
-/// Board renders as a labelled list of all pieces.
-impl fmt::Display for BoardState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.pieces.is_empty() {
-            return write!(f, "  (board is empty)");
-        }
-        for piece in &self.pieces {
-            writeln!(f, "{piece}")?;
-        }
-        Ok(())
-    }
-}
-
-// ── SERVER MESSAGES ───────────────────────────────────────────────────────────
-
-enum ServerMsg {
-    Waiting,
-    Ready      { player_id: u8 },
-    YourTurn,
-    OpponentTurn,
-    Ok,
-    Error      (String),
-    State      (BoardState),
-    Disconnected,
-    Unknown    (String),
-}
-
-impl ServerMsg {
-    fn parse(line: &str) -> Self {
-        if line == "WAITING"        { return Self::Waiting; }
-        if line == "YOUR_TURN"      { return Self::YourTurn; }
-        if line == "OPPONENT_TURN"  { return Self::OpponentTurn; }
-        if line == "OK"             { return Self::Ok; }
-        if line == "DISCONNECTED"   { return Self::Disconnected; }
-
-        if let Some(rest) = line.strip_prefix("READY ") {
-            if let Ok(id) = rest.trim().parse::<u8>() {
-                return Self::Ready { player_id: id };
-            }
-        }
-        if let Some(rest) = line.strip_prefix("ERROR ") {
-            return Self::Error(rest.trim().to_string());
-        }
-        if let Some(rest) = line.strip_prefix("STATE ") {
-            if let Some(board) = BoardState::parse(rest) {
-                return Self::State(board);
-            }
-        }
-        Self::Unknown(line.to_string())
-    }
-}
-
-/// Each server message knows how to display itself to the player.
-impl fmt::Display for ServerMsg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ServerMsg::Waiting =>
-                write!(f, "Waiting for a second player to connect…"),
-            ServerMsg::Ready { player_id } =>
-                write!(f, "Game on!  You are Player {player_id}."),
-            ServerMsg::YourTurn =>
-                write!(f, ""),          // prompt is printed separately
-            ServerMsg::OpponentTurn =>
-                write!(f, "Opponent's turn — waiting…"),
-            ServerMsg::Ok =>
-                write!(f, "Move accepted."),
-            ServerMsg::Error(reason) =>
-                write!(f, "Rejected: {reason}"),
-            ServerMsg::State(board) =>
-                write!(f, "Board:\n{board}"),
-            ServerMsg::Disconnected =>
-                write!(f, "Opponent disconnected.  Game over."),
-            ServerMsg::Unknown(raw) =>
-                write!(f, "(unknown message: {raw:?})"),
-        }
-    }
-}
-
-// ── USER INPUT ────────────────────────────────────────────────────────────────
-
-/// A validated command ready to be sent over the wire.
-enum Cmd {
-    Place { x: f32, y: f32, radius: f32 },
-    Shoot { index: usize, dx: f32, dy: f32, force: f32 },
-}
-
-impl Cmd {
-    /// Parse a line typed by the player (case-insensitive keyword).
-    fn parse(raw: &str) -> Result<Self, String> {
-        let mut t = raw.split_whitespace();
-        match t.next().unwrap_or("").to_ascii_uppercase().as_str() {
-            "PLACE" => {
-                let x      = parse_f32(&mut t, "x")?;
-                let y      = parse_f32(&mut t, "y")?;
-                let radius = parse_f32(&mut t, "radius")?;
-                if radius <= 0.0 {
-                    return Err("radius must be > 0".into());
-                }
-                Ok(Self::Place { x, y, radius })
-            }
-            "SHOOT" => {
-                let index = t.next()
-                    .ok_or("missing piece index")?
-                    .parse::<usize>()
-                    .map_err(|_| "piece index must be a whole number".to_string())?;
-                let dx    = parse_f32(&mut t, "dx")?;
-                let dy    = parse_f32(&mut t, "dy")?;
-                let force = parse_f32(&mut t, "force")?;
-                if force <= 0.0 {
-                    return Err("force must be > 0".into());
-                }
-                Ok(Self::Shoot { index, dx, dy, force })
-            }
-            "" => Err("empty input".into()),
-            kw => Err(format!("unknown command '{kw}'")),
-        }
-    }
-
-    /// Serialise to the wire format expected by the server.
-    fn to_wire(&self) -> String {
-        match self {
-            Self::Place { x, y, radius } =>
-                format!("PLACE {x} {y} {radius}\n"),
-            Self::Shoot { index, dx, dy, force } =>
-                format!("SHOOT {index} {dx} {dy} {force}\n"),
-        }
-    }
-}
-
-fn parse_f32<'a>(
-    t: &mut impl Iterator<Item = &'a str>,
-    name: &str,
-) -> Result<f32, String> {
-    t.next()
-        .ok_or_else(|| format!("missing {name}"))?
-        .parse::<f32>()
-        .map_err(|_| format!("{name} must be a number"))
-}
-
-// ── PROMPT ────────────────────────────────────────────────────────────────────
-
-fn print_prompt(player_id: u8) {
-    print!("\nP{player_id}> ");
-    io::stdout().flush().ok();
-}
-
-fn print_help() {
-    println!("  Commands:");
-    println!("    place <x> <y> <radius>          — place a new piece");
-    println!("    shoot <piece#> <dx> <dy> <force> — shoot an existing piece");
-}
-
-// ── MAIN ──────────────────────────────────────────────────────────────────────
-
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = Args::parse();
-    let log  = Logger::new(args.verbose);
 
-    log.info(ClientEvent::Connecting { addr: &args.addr });
+    let (server_tx, bevy_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (bevy_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
-    let stream = match TcpStream::connect(&args.addr).await {
+    // Networking runs in its own OS thread with its own tokio runtime so that
+    // Bevy can own the main thread unmodified.
+    let addr = args.server.clone();
+    let name = args.name.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(net_task(addr, name, server_tx, client_rx));
+    });
+
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .init_state::<GameState>()
+        .insert_resource(OrderQueue::default())
+        .insert_resource(CurrentTurn::default())
+        .insert_resource(LocalPlayerId::default())
+        .insert_resource(ShipEntities::default())
+        .insert_resource(NetRx(Mutex::new(bevy_rx)))
+        .insert_resource(NetTx(bevy_tx))
+        .add_systems(Startup, setup_camera)
+        .add_systems(Update, poll_network)
+        .add_systems(
+            Update,
+            (input::handle_input, submit_orders).run_if(in_state(GameState::Planning)),
+        )
+        .run();
+}
+
+fn setup_camera(mut commands: Commands) {
+    commands.spawn(Camera2d);
+}
+
+// ── Async networking task (separate thread) ───────────────────────────────────
+
+async fn net_task(
+    addr: String,
+    player_name: String,
+    server_tx: mpsc::UnboundedSender<ServerMessage>,
+    mut client_rx: mpsc::UnboundedReceiver<ClientMessage>,
+) {
+    let stream = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to connect to {}: {e}", args.addr);
-            std::process::exit(1);
+            eprintln!("[net] Failed to connect to {addr}: {e}");
+            return;
         }
     };
+    eprintln!("[net] Connected to {addr}");
 
-    log.info(ClientEvent::Connected { addr: &args.addr });
+    let mut session = Session::<ServerMessage, ClientMessage>::new(stream);
 
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut server_lines = BufReader::new(reader).lines();
-    let mut stdin_lines  = BufReader::new(tokio::io::stdin()).lines();
-
-    // Game state tracked client-side.
-    let mut player_id: u8 = 0;
-    let mut my_turn       = false;
+    if let Err(e) = session.send(&ClientMessage::Join { player_name }).await {
+        eprintln!("[net] Failed to send Join: {e}");
+        return;
+    }
 
     loop {
         tokio::select! {
-            // ── Server → Client ───────────────────────────────────────────────
-            result = server_lines.next_line() => {
-                let raw = match result {
-                    Ok(Some(l)) => l,
-                    _ => {
-                        log.info(ClientEvent::Disconnected);
-                        println!("\nDisconnected from server.");
-                        break;
-                    }
-                };
-
-                log.trace(ClientEvent::Received { raw: &raw });
-
-                let msg = ServerMsg::parse(raw.trim());
-
-                match &msg {
-                    ServerMsg::Ready { player_id: id } => {
-                        player_id = *id;
-                        println!("\n{msg}");
-                        print_help();
-                    }
-                    ServerMsg::YourTurn => {
-                        my_turn = true;
-                        print_prompt(player_id);
-                    }
-                    ServerMsg::Error(_) => {
-                        println!("\n{msg}");
-                        // Turn stays with us; re-prompt.
-                        if my_turn {
-                            print_prompt(player_id);
-                        }
-                    }
-                    ServerMsg::Disconnected => {
-                        println!("\n{msg}");
-                        break;
-                    }
-                    ServerMsg::OpponentTurn => {
-                        my_turn = false;
-                        println!("\n{msg}");
-                    }
-                    ServerMsg::Ok => {
-                        // Followed immediately by STATE; don't print yet.
-                        log.verbose(format!("server acknowledged move"));
-                    }
-                    ServerMsg::State(_) | ServerMsg::Waiting | ServerMsg::Unknown(_) => {
-                        println!("\n{msg}");
+            result = session.recv() => match result {
+                Ok(Some(msg)) => {
+                    if server_tx.send(msg).is_err() {
+                        break; // Bevy shut down
                     }
                 }
-            }
-
-            // ── Stdin → Server (only when it is our turn) ─────────────────────
-            result = stdin_lines.next_line(), if my_turn => {
-                let raw = match result {
-                    Ok(Some(l)) => l,
-                    _ => {
-                        println!("\nInput closed.");
-                        break;
-                    }
-                };
-
-                let trimmed = raw.trim();
-
-                if trimmed.is_empty() {
-                    print_prompt(player_id);
-                    continue;
-                }
-
-                if matches!(trimmed.to_ascii_uppercase().as_str(), "HELP" | "?") {
-                    print_help();
-                    print_prompt(player_id);
-                    continue;
-                }
-
-                match Cmd::parse(trimmed) {
-                    Ok(cmd) => {
-                        let wire = cmd.to_wire();
-                        log.verbose(ClientEvent::Sending { cmd: wire.trim_end() });
-                        if writer.write_all(wire.as_bytes()).await.is_err() {
-                            eprintln!("Failed to send command.");
-                            break;
-                        }
-                        // Disable stdin until the server responds (OK or ERROR).
-                        my_turn = false;
-                    }
-                    Err(reason) => {
-                        println!("  ? {reason}");
-                        print_help();
-                        print_prompt(player_id);
+                Ok(None) => { eprintln!("[net] Server closed connection"); break; }
+                Err(e)   => { eprintln!("[net] Recv error: {e}"); break; }
+            },
+            msg = client_rx.recv() => match msg {
+                Some(m) => {
+                    if let Err(e) = session.send(&m).await {
+                        eprintln!("[net] Send error: {e}"); break;
                     }
                 }
-            }
+                None => break, // Bevy shut down
+            },
         }
+    }
+
+    eprintln!("[net] Disconnected");
+}
+
+// ── Bevy systems ──────────────────────────────────────────────────────────────
+
+/// Drain the inbound channel every frame. Handles all server messages:
+/// updates local player state, reconciles ship entities, drives GameState.
+fn poll_network(
+    mut commands: Commands,
+    net_rx: Res<NetRx>,
+    mut local_id: ResMut<LocalPlayerId>,
+    mut ship_entities: ResMut<ShipEntities>,
+    mut positions: Query<&mut Position>,
+    mut healths: Query<&mut Health>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut current_turn: ResMut<CurrentTurn>,
+) {
+    let mut rx = net_rx.0.lock().unwrap();
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            ServerMessage::Welcome { player_id } => {
+                info!("Joined as player {player_id}");
+                local_id.0 = Some(player_id);
+            }
+            ServerMessage::TurnStarted { turn } => {
+                info!("Turn {turn} started — Planning");
+                current_turn.0 = turn;
+                next_state.set(GameState::Planning);
+            }
+            ServerMessage::TurnResolved { turn } => {
+                info!("Turn {turn} resolved — Animating");
+                next_state.set(GameState::Animating);
+            }
+            ServerMessage::StateSnapshot(bytes) => {
+                match bincode::deserialize::<GameSnapshot>(&bytes) {
+                    Ok(snap) => reconcile_ships(
+                        &mut commands,
+                        &mut ship_entities,
+                        &mut positions,
+                        &mut healths,
+                        snap,
+                    ),
+                    Err(e) => warn!("Bad snapshot: {e}"),
+                }
+            }
+            ServerMessage::Error(e) => warn!("Server error: {e}"),
+            ServerMessage::Pong => {}
+        }
+    }
+}
+
+/// Update existing ship entities from a snapshot, spawn new ones, despawn removed.
+/// Keeps the same Entity alive across turns — Phase 4 animation will lerp between states.
+fn reconcile_ships(
+    commands: &mut Commands,
+    ship_entities: &mut ShipEntities,
+    positions: &mut Query<&mut Position>,
+    healths: &mut Query<&mut Health>,
+    snap: GameSnapshot,
+) {
+    let snap_ids: HashSet<u32> = snap.ships.iter().map(|s| s.id).collect();
+
+    // Despawn ships no longer in the snapshot
+    ship_entities.0.retain(|id, entity| {
+        if !snap_ids.contains(id) {
+            commands.entity(*entity).despawn();
+            false
+        } else {
+            true
+        }
+    });
+
+    // Update existing ships or spawn new ones
+    for ship in &snap.ships {
+        if let Some(&entity) = ship_entities.0.get(&ship.id) {
+            if let Ok(mut pos) = positions.get_mut(entity) {
+                pos.hex = Hex::new(ship.q, ship.r);
+            }
+            if let Ok(mut hp) = healths.get_mut(entity) {
+                hp.0 = ship.health;
+            }
+        } else {
+            let entity = commands
+                .spawn((
+                    ShipId(ship.id),
+                    Ship { owner_id: ship.owner_id },
+                    Position { hex: Hex::new(ship.q, ship.r) },
+                    Health(ship.health),
+                ))
+                .id();
+            ship_entities.0.insert(ship.id, entity);
+        }
+    }
+}
+
+/// Send the local order queue to the server when the player presses Enter or Space.
+fn submit_orders(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut orders: ResMut<OrderQueue>,
+    net_tx: Res<NetTx>,
+    current_turn: Res<CurrentTurn>,
+) {
+    if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
+        let queued = std::mem::take(&mut orders.orders);
+        info!(
+            "Submitting {} order(s) for turn {}",
+            queued.len(),
+            current_turn.0
+        );
+        net_tx
+            .0
+            .send(ClientMessage::SubmitOrders {
+                turn: current_turn.0,
+                orders: queued,
+            })
+            .ok();
     }
 }

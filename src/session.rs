@@ -1,45 +1,50 @@
+use std::io;
+use std::marker::PhantomData;
+
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use futures::{SinkExt, StreamExt};
+use bytes::Bytes;
+use serde::{Serialize, de::DeserializeOwned};
 
-pub struct Session<L: GameLogic> {
-    reader: tokio::io::ReadHalf<TcpStream>,
-    writer: tokio::io::WriteHalf<TcpStream>,
-    logic: L,
+pub struct Session<In, Out> {
+    framed: Framed<TcpStream, LengthDelimitedCodec>,
+    _marker: PhantomData<(In, Out)>,
 }
 
-pub trait GameLogic {
-    type Message;
-
-    fn on_message(&mut self, msg: Self::Message) -> Option<Self::Message>;
-}
-
-impl<L: GameLogic> Session<L>
+impl<In, Out> Session<In, Out>
 where
-    L::Message: From<Vec<u8>> + Into<Vec<u8>>,
+    In: DeserializeOwned,
+    Out: Serialize,
 {
-    pub fn new(stream: TcpStream, logic: L) -> Self {
-        let (reader, writer) = tokio::io::split(stream);
-        Self { reader, writer, logic }
+    pub fn new(stream: TcpStream) -> Self {
+        let codec = LengthDelimitedCodec::new();
+        let framed = Framed::new(stream, codec);
+
+        Self {
+            framed,
+            _marker: PhantomData,
+        }
     }
 
-    pub async fn run(mut self) -> tokio::io::Result<()> {
-        let mut buffer = vec![0u8; 1024];
-
-        loop {
-            let n = self.reader.read(&mut buffer).await?;
-
-            if n == 0 {
-                break; // connection closed
+    /// Receive a typed message
+    pub async fn recv(&mut self) -> io::Result<Option<In>> {
+        match self.framed.next().await {
+            Some(Ok(bytes)) => {
+                let msg = bincode::deserialize::<In>(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(msg))
             }
-
-            let msg = L::Message::from(buffer[..n].to_vec());
-
-            if let Some(response) = self.logic.on_message(msg) {
-                let bytes: Vec<u8> = response.into();
-                self.writer.write_all(&bytes).await?;
-            }
+            Some(Err(e)) => Err(e),
+            None => Ok(None), // connection closed
         }
+    }
 
-        Ok(())
+    /// Send a typed message
+    pub async fn send(&mut self, msg: &Out) -> io::Result<()> {
+        let bytes = bincode::serialize(msg)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        self.framed.send(Bytes::from(bytes)).await
     }
 }
