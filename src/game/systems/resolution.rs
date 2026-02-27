@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::orders::Order;
+use crate::game::orders::Order;
 
 /// Authoritative ship state used by the server for turn resolution.
 /// Kept separate from the Bevy ECS components so it can be used and

@@ -20,6 +20,38 @@ impl Hex {
         ]
     }
 
+    /// Flat-top axial hex → world pixel position.
+    /// `size` is the circumradius (center-to-corner distance).
+    pub fn to_world(&self, size: f32) -> bevy::math::Vec2 {
+        let x = size * 1.5 * self.q as f32;
+        let y = size * (f32::sqrt(3.0) / 2.0 * self.q as f32 + f32::sqrt(3.0) * self.r as f32);
+        bevy::math::Vec2::new(x, y)
+    }
+
+    /// World pixel position → nearest flat-top hex (inverse of `to_world`).
+    pub fn pixel_to_hex(pos: bevy::math::Vec2, size: f32) -> Hex {
+        let q_frac = pos.x * 2.0 / 3.0 / size;
+        let r_frac = (-pos.x + pos.y * f32::sqrt(3.0)) / (3.0 * size);
+        Self::axial_round(q_frac, r_frac)
+    }
+
+    fn axial_round(frac_q: f32, frac_r: f32) -> Hex {
+        let frac_s = -frac_q - frac_r;
+        let q = frac_q.round();
+        let r = frac_r.round();
+        let s = frac_s.round();
+        let dq = (q - frac_q).abs();
+        let dr = (r - frac_r).abs();
+        let ds = (s - frac_s).abs();
+        if dq > dr && dq > ds {
+            Hex::new((-r - s) as i32, r as i32)
+        } else if dr > ds {
+            Hex::new(q as i32, (-q - s) as i32)
+        } else {
+            Hex::new(q as i32, r as i32)
+        }
+    }
+
     /// Hex grid distance in axial coordinates.
     pub fn distance(&self, other: &Hex) -> i32 {
         let dq = self.q - other.q;
@@ -82,5 +114,33 @@ mod tests {
         for n in h.neighbors() {
             assert_ne!(n, h);
         }
+    }
+}
+
+#[cfg(test)]
+mod world_tests {
+    use super::*;
+    use bevy::math::Vec2;
+
+    #[test]
+    fn to_world_and_back_roundtrip() {
+        let cases = [
+            Hex::new(0, 0),
+            Hex::new(1, 0),
+            Hex::new(0, 1),
+            Hex::new(-1, 1),
+            Hex::new(3, -2),
+            Hex::new(-4, 3),
+        ];
+        for h in cases {
+            let world = h.to_world(40.0);
+            let back = Hex::pixel_to_hex(world, 40.0);
+            assert_eq!(back, h, "roundtrip failed for {h:?} via world {world:?}");
+        }
+    }
+
+    #[test]
+    fn pixel_near_center_snaps_to_origin() {
+        assert_eq!(Hex::pixel_to_hex(Vec2::new(1.0, -1.0), 40.0), Hex::new(0, 0));
     }
 }

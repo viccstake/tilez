@@ -1,18 +1,26 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use anyhow::bail;
 use bevy::prelude::*;
 use clap::Parser;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use naval_game::game::components::{Health, Position, Ship, ShipId};
+use naval_game::game::components::{Health, Position, Ship, ShipId, TargetPosition};
+use naval_game::game::gui::animation::animate_transitions;
+use naval_game::game::gui::hud::{
+    setup_hud, update_roster_text, update_state_text, update_turn_text,
+};
+use naval_game::game::gui::rendering::spawn_ship_visuals;
 use naval_game::game::hex::Hex;
-use naval_game::game::resources::{CurrentTurn, OrderQueue};
+use naval_game::game::resources::{CurrentTurn, HexLayout, LocalPlayerId, OrderQueue, Selection};
 use naval_game::game::state::GameState;
 use naval_game::game::systems::input;
-use naval_game::protocol::{ClientMessage, GameSnapshot, ServerMessage};
-use naval_game::session::Session;
+use naval_game::game::systems::input::clear_selection_on_animate;
+use naval_game::game::systems::setup::setup_board;
+use naval_game::net::protocol::{ClientMessage, GameSnapshot, ServerMessage};
+use naval_game::net::Session;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -26,6 +34,14 @@ struct Args {
     /// Player name
     #[arg(short, long, default_value = "Player")]
     name: String,
+
+    /// Run a network-only client (no Bevy window), auto-submitting empty orders.
+    #[arg(long, default_value_t = false)]
+    headless: bool,
+
+    /// Number of resolved turns before exiting in headless mode.
+    #[arg(long, default_value_t = 2)]
+    max_turns: u32,
 }
 
 // ── Networking resources ──────────────────────────────────────────────────────
@@ -38,9 +54,6 @@ struct NetRx(Mutex<mpsc::UnboundedReceiver<ServerMessage>>);
 #[derive(Resource)]
 struct NetTx(mpsc::UnboundedSender<ClientMessage>);
 
-#[derive(Resource, Default)]
-struct LocalPlayerId(Option<u32>);
-
 /// Maps server ship ID → Bevy entity so snapshots update entities in place.
 #[derive(Resource, Default)]
 struct ShipEntities(HashMap<u32, Entity>);
@@ -49,6 +62,17 @@ struct ShipEntities(HashMap<u32, Entity>);
 
 fn main() {
     let args = Args::parse();
+    if args.headless {
+        if let Err(e) = run_headless(args) {
+            eprintln!("[headless] Error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    run_gui(args);
+}
+
+fn run_gui(args: Args) {
 
     let (server_tx, bevy_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let (bevy_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -66,21 +90,85 @@ fn main() {
     });
 
     App::new()
-        .add_plugins(DefaultPlugins)
+        .add_plugins(
+            DefaultPlugins
+                .set(bevy::log::LogPlugin {
+                    level: bevy::log::Level::INFO,
+                    filter: "sctk_adwaita=off".into(),
+                    ..default()
+                })
+                .disable::<bevy::audio::AudioPlugin>()
+        )
         .init_state::<GameState>()
         .insert_resource(OrderQueue::default())
         .insert_resource(CurrentTurn::default())
         .insert_resource(LocalPlayerId::default())
+        .insert_resource(Selection::default())
         .insert_resource(ShipEntities::default())
+        .insert_resource(HexLayout::default())
         .insert_resource(NetRx(Mutex::new(bevy_rx)))
         .insert_resource(NetTx(bevy_tx))
-        .add_systems(Startup, setup_camera)
+        .add_systems(Startup, (setup_camera, setup_board, setup_hud))
         .add_systems(Update, poll_network)
+        .add_systems(Update, spawn_ship_visuals)
+        .add_systems(Update, (update_turn_text, update_state_text, update_roster_text))
+        .add_systems(OnEnter(GameState::Animating), clear_selection_on_animate)
+        .add_systems(
+            Update,
+            animate_transitions.run_if(in_state(GameState::Animating)),
+        )
         .add_systems(
             Update,
             (input::handle_input, submit_orders).run_if(in_state(GameState::Planning)),
         )
         .run();
+}
+
+fn run_headless(args: Args) -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(headless_task(args.server, args.name, args.max_turns))
+}
+
+async fn headless_task(addr: String, player_name: String, max_turns: u32) -> anyhow::Result<()> {
+    let stream = TcpStream::connect(&addr).await?;
+    let mut session = Session::<ServerMessage, ClientMessage>::new(stream);
+    session.send(&ClientMessage::Join { player_name: player_name.clone() }).await?;
+    eprintln!("[headless:{player_name}] Connected to {addr}");
+
+    let mut resolved_turns = 0_u32;
+    while let Some(msg) = session.recv().await? {
+        match msg {
+            ServerMessage::Welcome { player_id } => {
+                eprintln!("[headless:{player_name}] Welcome as player {player_id}");
+            }
+            ServerMessage::TurnStarted { turn } => {
+                eprintln!("[headless:{player_name}] Turn {turn} started, submitting 0 orders");
+                session
+                    .send(&ClientMessage::SubmitOrders {
+                        turn,
+                        orders: vec![],
+                    })
+                    .await?;
+            }
+            ServerMessage::TurnResolved { turn } => {
+                resolved_turns += 1;
+                eprintln!("[headless:{player_name}] Turn {turn} resolved");
+                if resolved_turns >= max_turns {
+                    eprintln!(
+                        "[headless:{player_name}] Reached max_turns={max_turns}, disconnecting"
+                    );
+                    return Ok(());
+                }
+            }
+            ServerMessage::StateSnapshot(_) => {}
+            ServerMessage::Error(e) => bail!("server error: {e}"),
+            ServerMessage::Pong => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn setup_camera(mut commands: Commands) {
@@ -145,7 +233,6 @@ fn poll_network(
     net_rx: Res<NetRx>,
     mut local_id: ResMut<LocalPlayerId>,
     mut ship_entities: ResMut<ShipEntities>,
-    mut positions: Query<&mut Position>,
     mut healths: Query<&mut Health>,
     mut next_state: ResMut<NextState<GameState>>,
     mut current_turn: ResMut<CurrentTurn>,
@@ -158,9 +245,12 @@ fn poll_network(
                 local_id.0 = Some(player_id);
             }
             ServerMessage::TurnStarted { turn } => {
-                info!("Turn {turn} started — Planning");
+                info!("Turn {turn} started");
                 current_turn.0 = turn;
-                next_state.set(GameState::Planning);
+                // Do NOT set state here — animate_transitions drives the
+                // Planning transition once all ship lerps complete.
+                // Setting Planning here would cancel the Animating transition
+                // set by TurnResolved (all three messages arrive in one frame).
             }
             ServerMessage::TurnResolved { turn } => {
                 info!("Turn {turn} resolved — Animating");
@@ -171,7 +261,6 @@ fn poll_network(
                     Ok(snap) => reconcile_ships(
                         &mut commands,
                         &mut ship_entities,
-                        &mut positions,
                         &mut healths,
                         snap,
                     ),
@@ -185,11 +274,11 @@ fn poll_network(
 }
 
 /// Update existing ship entities from a snapshot, spawn new ones, despawn removed.
-/// Keeps the same Entity alive across turns — Phase 4 animation will lerp between states.
+/// For existing ships, inserts `TargetPosition` so `animate_transitions` can lerp
+/// the visual toward the new hex.  New ships appear at their position immediately.
 fn reconcile_ships(
     commands: &mut Commands,
     ship_entities: &mut ShipEntities,
-    positions: &mut Query<&mut Position>,
     healths: &mut Query<&mut Health>,
     snap: GameSnapshot,
 ) {
@@ -208,13 +297,14 @@ fn reconcile_ships(
     // Update existing ships or spawn new ones
     for ship in &snap.ships {
         if let Some(&entity) = ship_entities.0.get(&ship.id) {
-            if let Ok(mut pos) = positions.get_mut(entity) {
-                pos.hex = Hex::new(ship.q, ship.r);
-            }
+            // Set the animation target; animate_transitions will lerp and then
+            // update Position once complete.
+            commands.entity(entity).insert(TargetPosition { hex: Hex::new(ship.q, ship.r) });
             if let Ok(mut hp) = healths.get_mut(entity) {
                 hp.0 = ship.health;
             }
         } else {
+            // Brand-new ship: appears directly at its position, no lerp.
             let entity = commands
                 .spawn((
                     ShipId(ship.id),

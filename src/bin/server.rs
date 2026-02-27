@@ -7,9 +7,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use naval_game::game::orders::Order;
-use naval_game::game::resolution::{resolve_turn, ShipState};
-use naval_game::protocol::{ClientMessage, GameSnapshot, ServerMessage, ShipSnapshot};
-use naval_game::session::Session;
+use naval_game::game::systems::resolution::{resolve_turn, ShipState};
+use naval_game::net::protocol::{ClientMessage, GameSnapshot, ServerMessage, ShipSnapshot};
+use naval_game::net::Session;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -104,7 +104,11 @@ impl GameServer {
         let snap_bytes = self.snapshot_bytes();
         self.broadcast(&ServerMessage::TurnStarted { turn: self.turn });
         self.broadcast(&ServerMessage::StateSnapshot(snap_bytes));
-        info!("Game started — turn {}", self.turn);
+        let roster: Vec<&str> = self.players.iter()
+            .filter(|p| p.connected)
+            .map(|p| p.name.as_str())
+            .collect();
+        info!("Game started — turn {} — players: {}", self.turn, roster.join(", "));
     }
 
     fn submit_orders(&mut self, player_id: u32, turn: u32, orders: Vec<Order>) {

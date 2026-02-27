@@ -7,15 +7,15 @@ edition = "2024"
 name = "naval_game"
 
 [features]
-# The "game" feature pulls in Bevy for client-side rendering.
-# It is NOT required to build or run the dedicated server.
-#
-#   Build server only:          cargo build --bin server
-#   Build full game (+ Bevy):   cargo build --features game
-game = ["dep:bevy"]
+# The "render" feature pulls in Bevy for client-side rendering.
+# It is NOT required to build or run either client or server.
+render = []
+# The "resolve" feature means that you produce your own next state. 
+# It IS required by the server (for now).
+resolve = []
 
 [dependencies]
-bevy  = { version = "0.18.0", optional = true }
+bevy  = { version = "0.18.0", optional = false }
 clap  = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -29,7 +29,7 @@ tracing-subscriber = "0.3"
 
 [[bin]]
 name = "server"
+required-features = ["resolve"]
 
 [[bin]]
 name = "client"
-required-features = ["game"]

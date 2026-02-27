@@ -1,53 +1,59 @@
 
 ## Doc
 
-| File              | Responsibility |
-| ----------------- | -------------- |
-| src/game.rs       | Standalone file for running, interacting and rendering the game    |
-| src/session.rs    | Send-and-receive API for 1 TCP session                            |
-| src/logger.rs     | Logger struct for stdout, stderr                                  |
-| src/bin/server.rs | Entry point — host the game                                       |
-| src/bin/client.rs | Entry point — connect to a game server                            |
-  
 ### Run commands:
 ```sh
-  cargo run --bin server                    # Terminal 1 — start the server
+  cargo run --bin server --features resolve   # Terminal 1 — start the server
 
-  cargo run --bin client                    # Terminal 2 — Player 1 connects
+  cargo run --bin client --features render    # Terminal 2 — Player 1 connects
 
-  cargo run --bin client                    # Terminal 3 — Player 2 connects
+  cargo run --bin client                      # Terminal 3 — Player 2 connects
+  ...
 
-  cargo run --bin client 192.168.x.x:7878   # To connect from another machine:
+  cargo run --bin client 192.168.x.x:7878     # To connect from another machine:
 ```
+
 ### Build commands:
 ```sh 
-  cargo build --bin server          # server only (no Bevy needed)
+  cargo build --bin server --features resolve 
 
-  cargo build --features game       # full crate including Bevy ECS module
-
-  ./target/debug/server -vvv        # run with full trace logging
+  cargo build --bin client --features render
+  
+  # run with full trace logging
+  ./target/debug/server -vvv
 ```
 
-
-
-# 🛠 Project Summary — Multiplayer Naval Strategy Game (Rust + Bevy)
+# 🛠 Project Summary — Multiplayer Naval Strategy Game (Rust + Bevy + Tokio)
 
 ## 🎯 Goal
 
-A **robust hobby-grade multiplayer naval strategy game** written in Rust using:
+A **robust multiplayer naval strategy game** written in Rust using:
 
 * **Bevy** for client-side rendering and ECS game logic
 * **Tokio** for networking
 * **Authoritative server model**
-* Support for **~5 concurrent players**
+* Support for **32 concurrent players**
 * 1 server instance = 1 game session
 
 The system should be:
 
-* Deterministic
-* Fault tolerant
+* Deterministic - procedural seed generation
+* Fault tolerant - by leveraging funtional programming and idiomatic Rust
+  - First priority is on implementing external traits to handle as much application fault tolerance as possible (e.g. impl Drop)
 * Cleanly architected
-* Scalable in design (even if small in scope)
+  - Two binaries: Client and Server
+  - Use Rust's package management with path flattening to stucture the code in different files by
+    1. Communication (`net`)
+    2. State / API (`game`)
+    3. Render / UI (`gui`)
+  - Use internal traits to support dynamic dispatch for central code
+  - Leverage determenistic Bevy to handle all game logic and resolution of actions
+* Scalable in design
+  - Adding MORE of something (e.g. new ships) should be trivial
+  - Logic inside the game grouped (using traits) in such a way that providing a new feature to some existing set of features is easy
+  - Cargo features dictate how the binary is built
+    - Resolve: Binary produces its own next state (i.e. `resolve_turn` is included and used)
+    - Render: The bevy GUI is rendered (appearance depends on binary implementation). If this feature is not set, I/O is handled through the network interface.
 
 ---
 
@@ -55,7 +61,9 @@ The system should be:
 
 ### Genre
 
-Turn-based naval strategy game on a **hexagonal grid**.
+Turn-based naval strategy game on a **hexagonal grid**. 
+
+Each player locks in their moves and all moves are executed "simaltenously" (peaudo-description = iterate orders left: order.do(1 unit of work))
 
 ### Core Mechanics
 
@@ -73,10 +81,31 @@ Turn-based naval strategy game on a **hexagonal grid**.
 
 Server is authoritative for:
 
-* Order validation
-* Turn resolution
-* Game state snapshots
+* Order validation 
+* Turn resolution (producing the next state)
+* Game state snapshots (all clients get this snapshot)
 
+Client runs the same game but:
+
+* The game is just reflecting the state from the server, and provides an interactive GUI (and Terminal) API for the user.
+* The GUI should provide a HUD, Sidebars, Menus, Camera View, Animated Map.
+* The player should be prompted with valid orders in the GUI inferred from the state for each owned ship.
+* After an order is placed, it gets forwarded to the server, possibly overwriting an old order. The server responds if the move has been registered.
+* The server sends back a state snapshot after each turn, the animation is inferred from the transition from old to new state.
+
+### Root Structs (inexchangeable in the codebase)
+```rust
+struct Player {
+  identifier: PlayerId,
+  level: impl ProgressionTracking,
+  game: GameState
+}
+```
+```rust
+struct GameState {
+  board: HexGrid<u64>
+}
+```
 ---
 
 # 🏗 Architecture Overview
@@ -84,28 +113,33 @@ Server is authoritative for:
 ## Folder Structure
 
 ```
-src/
-├── bin/
-│   ├── client.rs
-│   └── server.rs
-├── game/
-│   ├── components.rs
-│   ├── config.rs
-│   ├── hex.rs
-│   ├── orders.rs
-│   ├── resources.rs
-│   ├── state.rs
-│   └── systems/
-│       ├── animation.rs
-│       ├── input.rs
-│       ├── resolution.rs
-│       ├── setup.rs
-│       └── turn.rs
-├── game.rs
-├── lib.rs
-├── logger.rs
-├── main.rs
-└── session.rs
+.
+└── src
+    ├── lib.rs
+    ├── main.rs
+    ├── bin
+    │   ├── client.rs
+    │   └── server.rs
+    ├── game
+    │   ├── mod.rs
+    │   ├── components.rs
+    │   ├── hex.rs
+    │   ├── orders.rs
+    │   ├── resources.rs
+    │   ├── state.rs
+    │   ├── gui
+    │   │   ├── hud.rs
+    │   │   ├── animation.rs
+    │   │   └── rendering.rs
+    │   └── systems
+    │       ├── mod.rs
+    │       ├── input.rs
+    │       ├── resolution.rs
+    │       └── setup.rs
+    └── net
+        ├── mod.rs
+        ├── protocol.rs
+        └── session.rs
 ```
 
 ---
@@ -202,8 +236,9 @@ Client is not authoritative.
 
 # 🔁 Game State Flow
 
-```
-Planning → Resolving → Animating → Planning
+```mermaid
+flowchart LR
+  P[Planning] --> R[Resolving] --> A[Animating] --> P
 ```
 
 * Planning: collect player orders
@@ -214,7 +249,7 @@ Planning → Resolving → Animating → Planning
 
 # 🔒 Robustness Requirements
 
-* Handles up to ~5 players reliably
+* Handles up to ~X players reliably
 * Graceful disconnect handling
 * Heartbeat (Ping/Pong) system
 * Deterministic turn resolution
@@ -234,9 +269,7 @@ Planning → Resolving → Animating → Planning
 
 3. Typed message protocol
 
-4. Minimal but production-grade design
-
-5. Designed for scalability (even if hobby scope)
+4. Scalable production-grade design
 
 ---
 
@@ -252,6 +285,3 @@ Planning → Resolving → Animating → Planning
 * Lockstep prediction
 
 ---
-
-**Context:**
-I am building a hobby-grade but robust multiplayer naval strategy game in Rust using Bevy (client) and Tokio (server). It supports ~5 players per match. The server is authoritative and handles deterministic simultaneous turn resolution on a hex grid. Networking uses TCP with length-prefixed framing and serde+bincode. The architecture cleanly separates game logic, networking (session layer), and rendering. Clients animate transitions between discrete turn states.
