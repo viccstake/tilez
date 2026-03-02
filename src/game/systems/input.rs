@@ -5,7 +5,7 @@ use crate::game::components::{Position, Ship, ShipId};
 use crate::game::hex::Hex;
 use crate::game::orders::Order;
 use crate::game::resources::{HexLayout, LocalPlayerId, OrderQueue, Selection};
-use crate::game::gui::rendering::owner_color;
+use crate::game::render::rendering::owner_color;
 
 /// Two-step click input (Planning state only).
 ///

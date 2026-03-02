@@ -4,4 +4,6 @@ pub mod systems;
 pub mod components;
 pub mod resources;
 pub mod state;
-pub mod gui;
+pub mod render;
+
+pub use render::*;

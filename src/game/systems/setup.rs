@@ -9,28 +9,43 @@ pub fn setup_game(mut commands: Commands) {
 }
 
 /// Spawn a flat-top hex tile sprite for every cell within `radius` of the origin.
-pub fn setup_board(mut commands: Commands, hex_layout: Res<HexLayout>) {
-    let radius: i32 = 7;
+pub fn setup_board(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    hex_layout: Res<HexLayout>,
+) {
+    // Rectangular grid dimensions (in offset coordinates).
+    const COLS: i32 = 16;
+    const ROWS: i32 = 10;
     let size = hex_layout.size;
-    // Tile sprite slightly smaller than the hex pitch to leave visible seams.
-    let sprite_size = Vec2::new(size * 1.42, size * f32::sqrt(3.0) * 0.95);
+    let col_center = COLS / 2;
+    let row_center = ROWS / 2;
 
-    for q in -radius..=radius {
-        let r_min = (-radius).max(-q - radius);
-        let r_max = radius.min(-q + radius);
-        for r in r_min..=r_max {
+    // One shared mesh for all tile entities; each tile has its own material color.
+    let tile_mesh = meshes.add(RegularPolygon::new(size * 0.95, 6));
+
+    // Build a rectangle in odd-q offset coordinates, then convert to centered axial.
+    // This keeps a rectangular board silhouette while still using axial math.
+    for col in 0..COLS {
+        for row in 0..ROWS {
+            let centered_col = col - col_center;
+            let centered_row = row - row_center;
+
+            // Odd-q offset (column-staggered) -> axial conversion.
+            let q = centered_col;
+            let odd = q.rem_euclid(2);
+            let r = centered_row - ((q - odd) / 2);
             let hex = Hex::new(q, r);
             let pos = hex.to_world(size);
+
             // Alternate two shades of ocean-blue for depth.
-            let shade = if (q - r).rem_euclid(2) == 0 { 0.26 } else { 0.31 };
+            let shade = if (col + row).rem_euclid(2) == 0 { 0.26 } else { 0.31 };
             let color = Color::srgb(shade, shade + 0.16, shade + 0.38);
             commands.spawn((
                 HexTile,
-                Sprite {
-                    color,
-                    custom_size: Some(sprite_size),
-                    ..default()
-                },
+                Mesh2d(tile_mesh.clone()),
+                MeshMaterial2d(materials.add(color)),
                 Transform::from_xyz(pos.x, pos.y, 0.0),
             ));
         }

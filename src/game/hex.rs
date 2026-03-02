@@ -24,7 +24,7 @@ impl Hex {
     /// `size` is the circumradius (center-to-corner distance).
     pub fn to_world(&self, size: f32) -> bevy::math::Vec2 {
         let x = size * 1.5 * self.q as f32;
-        let y = size * (f32::sqrt(3.0) / 2.0 * self.q as f32 + f32::sqrt(3.0) * self.r as f32);
+        let y = size * (f32::sqrt(3.0) / 2.0 * self.q as f32 + f32::sqrt(3.0) * self.r as f32) + (self.r % 2) as f32;
         bevy::math::Vec2::new(x, y)
     }
 

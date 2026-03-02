@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+convo1() {
+	codex resume 019ca503-b25a-73a0-905b-05373318ee23
+}
+
