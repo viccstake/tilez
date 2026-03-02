@@ -1,0 +1,8 @@
+[package]
+name = "render"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+game = { path = "../game" }
+bevy  = { version = "0.18.0", optional = false }

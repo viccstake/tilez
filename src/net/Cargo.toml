@@ -1,0 +1,12 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+serde = { workspace = true }
+bincode = "1.3"
+futures = "0.3"
