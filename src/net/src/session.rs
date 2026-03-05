@@ -1,11 +1,12 @@
-use std::io;
 use std::marker::PhantomData;
 
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use futures::{SinkExt, StreamExt};
-use bytes::Bytes;
-use serde::{Serialize, de::DeserializeOwned};
+
+use crate::error::{Error, Result};
 
 pub struct Session<In, Out> {
     framed: Framed<TcpStream, LengthDelimitedCodec>,
@@ -28,23 +29,24 @@ where
     }
 
     /// Receive a typed message
-    pub async fn recv(&mut self) -> io::Result<Option<In>> {
+    pub async fn recv(&mut self) -> Result<Option<In>> {
         match self.framed.next().await {
             Some(Ok(bytes)) => {
-                let msg = bincode::deserialize::<In>(&bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let msg = bincode::deserialize::<In>(&bytes).map_err(Error::Deserialize)?;
                 Ok(Some(msg))
             }
-            Some(Err(e)) => Err(e),
+            Some(Err(e)) => Err(Error::Io(e)),
             None => Ok(None), // connection closed
         }
     }
 
     /// Send a typed message
-    pub async fn send(&mut self, msg: &Out) -> io::Result<()> {
-        let bytes = bincode::serialize(msg)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    pub async fn send(&mut self, msg: &Out) -> Result<()> {
+        let bytes = bincode::serialize(msg).map_err(Error::Serialize)?;
 
-        self.framed.send(Bytes::from(bytes)).await
+        self.framed
+            .send(Bytes::from(bytes))
+            .await
+            .map_err(Error::Io)
     }
 }

@@ -1,29 +1,45 @@
+use crate::{Hex, ShipState};
 
-use crate::Hex;
-
-enum PrimitiveAction {
-    MoveTo(usize, usize),
-    Shoot(usize, usize),
+pub enum PrimitiveAction {
+    MoveTo(Hex),
+    Shoot(Hex),
     Hold,
 }
 
-trait Orderable {
-    fn move_to(&mut self, pos: Hex);
-    fn shoot_at(&mut self, pos: Hex);
-    fn hold_pos(&mut self);    
+pub enum Shoot {
+    Melee,
+    Ranged,
 }
 
-trait Workable<T> {
-    fn work(&mut self) -> Option<T>;
+pub trait Orderable {
+    type T;
+
+    fn move_to(&mut self, pos: Hex) -> Option<Self::T>;
+    fn shoot_at(&mut self, pos: Hex) -> Option<Self::T>;
+    fn hold_pos(&mut self) -> Option<Self::T>;
 }
 
-struct Order<E, A> {
-    entity: E,
-    action: A
-}
-
-impl From<(Entity, PrimitiveAction)> for Order<Entity, Action> {
-    fn from(value: (Entity, PrimitiveAction)) -> Self {
-        Self { entity: value.0, action: value.1 }
+impl<T> dyn Orderable<T = T> {
+    pub fn work(&mut self, order: PrimitiveAction) -> Option<T> {
+        match order {
+            PrimitiveAction::MoveTo(hx) => self.move_to(hx),
+            PrimitiveAction::Shoot(hx) => self.shoot_at(hx),
+            PrimitiveAction::Hold => self.hold_pos(),
+        }
     }
 }
+
+impl Orderable for ShipState {
+    type T = ShipState;
+    fn hold_pos(&mut self) -> Option<Self::T> {
+        todo!()
+    }
+    fn move_to(&mut self, pos: Hex) -> Option<Self::T> {
+        todo!()
+    }
+    fn shoot_at(&mut self, pos: Hex) -> Option<Self::T> {
+        todo!()
+    }
+}
+//
+// ...

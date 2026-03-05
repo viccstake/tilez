@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 game = { path = "../game" }
 bevy  = { version = "0.18.0", optional = false }
+thiserror = { workspace = true }

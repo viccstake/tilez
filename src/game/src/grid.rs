@@ -1,8 +1,82 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Hex {
-    pub q: i32,
-    pub r: i32,
+use soa_derive::StructOfArray;
+
+pub const WIDTH: usize = 100;
+pub const HEIGHT: usize = 60;
+
+
+/// A trait for 2D coordinate systems (Hex, Cartesian, Polar, etc.)
+pub trait TwoDCoordinate {
+    type Component;
+
+    fn new(x1: Self::Component, x2: Self::Component) -> Self;
+    
+    fn components(&self) -> (Self::Component, Self::Component);
 }
+
+#[derive(StructOfArray)]
+#[soa_derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Hex { pub q: i32, pub r: i32 }
+
+
+#[derive(StructOfArray)]
+#[soa_derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cartesian { pub x: f32, pub y: f32 }
+
+
+#[derive(StructOfArray)]
+#[soa_derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Polar { pub r: f32, pub theta: f32 }
+
+
+
+impl TwoDCoordinate for Hex {
+    type Component = i32;
+    fn new(q: i32, r: i32) -> Self { Self { q, r } }
+    fn components(&self) -> (i32, i32) { (self.q, self.r) }
+}
+
+impl TwoDCoordinate for Cartesian {
+    type Component = f32;
+    fn new(x: f32, y: f32) -> Self { Self { x, y } }
+    fn components(&self) -> (f32, f32) { (self.x, self.y) }
+}
+
+impl TwoDCoordinate for Polar {
+    type Component = f32;
+    fn new(r: f32, theta: f32) -> Self { Self { r, theta } }
+    fn components(&self) -> (f32, f32) { (self.r, self.theta) }
+}
+
+
+
+
+impl From<Polar> for Cartesian {
+    fn from(p: Polar) -> Self {
+        Self::new(p.r * p.theta.cos(), p.r * p.theta.sin())
+    }
+}
+impl From<Cartesian> for Polar {
+    fn from(c: Cartesian) -> Self {
+        let r = (c.x.powi(2) + c.y.powi(2)).sqrt();
+        let theta = c.y.atan2(c.x);
+        Self::new(r, theta)
+    }
+}
+impl From<Hex> for Cartesian {
+    fn from(value: Hex) -> Self {
+        return Self::new(value.q as f32, value.r as f32);
+    }
+}
+impl From<Cartesian> for Hex {
+    fn from(value: Cartesian) -> Self {
+        return Self::axial_round(value.x, value.y);
+    }
+}
+
+
 
 impl Hex {
     pub fn new(q: i32, r: i32) -> Self {
@@ -18,21 +92,6 @@ impl Hex {
             Hex::new(self.q + 1, self.r - 1),
             Hex::new(self.q - 1, self.r + 1),
         ]
-    }
-
-    /// Flat-top axial hex → world pixel position.
-    /// `size` is the circumradius (center-to-corner distance).
-    pub fn to_world(&self, size: f32) -> bevy::math::Vec2 {
-        let x = size * 1.5 * self.q as f32;
-        let y = size * (f32::sqrt(3.0) / 2.0 * self.q as f32 + f32::sqrt(3.0) * self.r as f32) + (self.r % 2) as f32;
-        bevy::math::Vec2::new(x, y)
-    }
-
-    /// World pixel position → nearest flat-top hex (inverse of `to_world`).
-    pub fn pixel_to_hex(pos: bevy::math::Vec2, size: f32) -> Hex {
-        let q_frac = pos.x * 2.0 / 3.0 / size;
-        let r_frac = (-pos.x + pos.y * f32::sqrt(3.0)) / (3.0 * size);
-        Self::axial_round(q_frac, r_frac)
     }
 
     fn axial_round(frac_q: f32, frac_r: f32) -> Hex {
