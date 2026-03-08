@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::Parser;
-use game::MatchState;
+use game::state::MatchState;
 use net::{ClientMessage, ServerMessage, Session};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;

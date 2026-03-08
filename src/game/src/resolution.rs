@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+
 /// Simultaneous turn resolution.
 ///
 /// For every `Move` order, the target hex is recorded by ship ID.
@@ -11,19 +13,20 @@ pub fn resolve_turn() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Hex;
 
-    fn ship(id: u32, q: i32, r: i32) -> () {
+    fn ship(_id: u32, _q: i32, _r: i32) -> () {
         todo!()
     }
 
-    fn mv(entity_id: u32, q: i32, r: i32) {
+    fn mv(_id: u32, _q: i32, _r: i32) {
         todo!()
     }
 
     #[test]
     fn uncontested_move_succeeds() {
         // ...
+        ship(0, 0, 0);
+        mv(0, 0, 0);
         resolve_turn();
         // ...
     }

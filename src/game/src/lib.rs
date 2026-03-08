@@ -1,20 +1,16 @@
 pub mod error;
+pub mod api;
 pub mod grid;
 pub mod orders;
-pub mod resolution;
 pub mod ship;
-pub mod state;
-pub mod state_store;
-pub mod turn;
-pub mod api;
 
-pub use error::*;
-pub use grid::*;
-pub use orders::*;
-pub use resolution::*;
-pub use ship::*;
-pub use state::*;
-pub use state_store::*;
-pub use turn::*;
+mod resolution;
 
 pub use api::*;
+pub use grid::*;
+pub use orders::*;
+pub use ship::ShipClass;
+
+pub use error::*;
+
+pub mod state;

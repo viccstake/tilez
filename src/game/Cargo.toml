@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 soa_derive = "0.14.0"
 thiserror = { workspace = true }
+uid = "0.1.8"

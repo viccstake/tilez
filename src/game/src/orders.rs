@@ -1,26 +1,21 @@
-use crate::{Hex, ShipState};
+#[allow(dead_code)]
 
-pub enum PrimitiveAction {
-    MoveTo(Hex),
-    Shoot(Hex),
-    Hold,
-}
+use crate::{Hex, Result};
 
-pub enum Shoot {
-    Melee,
-    Ranged,
-}
+use std::collections::LinkedList;
 
 pub trait Orderable {
-    type T;
-
-    fn move_to(&mut self, pos: Hex) -> Option<Self::T>;
-    fn shoot_at(&mut self, pos: Hex) -> Option<Self::T>;
-    fn hold_pos(&mut self) -> Option<Self::T>;
+    /// Return template
+    ///  Some()     : If you did some mutating work
+    ///  None       : If no work was done
+    ///  crate::Error  : For invalid orders
+    fn move_to(&mut self, pos: Hex) -> Result<Option<()>>;
+    fn shoot_at(&mut self, pos: Hex) -> Result<Option<()>>;
+    fn hold_pos(&mut self) -> Result<Option<()>>;
 }
 
-impl<T> dyn Orderable<T = T> {
-    pub fn work(&mut self, order: PrimitiveAction) -> Option<T> {
+impl dyn Orderable {
+    pub fn work(&mut self, order: PrimitiveAction) -> Result<Option<()>> {
         match order {
             PrimitiveAction::MoveTo(hx) => self.move_to(hx),
             PrimitiveAction::Shoot(hx) => self.shoot_at(hx),
@@ -29,17 +24,12 @@ impl<T> dyn Orderable<T = T> {
     }
 }
 
-impl Orderable for ShipState {
-    type T = ShipState;
-    fn hold_pos(&mut self) -> Option<Self::T> {
-        todo!()
-    }
-    fn move_to(&mut self, pos: Hex) -> Option<Self::T> {
-        todo!()
-    }
-    fn shoot_at(&mut self, pos: Hex) -> Option<Self::T> {
-        todo!()
-    }
+pub type Order = LinkedList<PrimitiveAction>;
+
+
+#[derive(Clone, Copy)]
+pub enum PrimitiveAction {
+    MoveTo(Hex),
+    Shoot(Hex),
+    Hold,
 }
-//
-// ...

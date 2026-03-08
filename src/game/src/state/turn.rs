@@ -1,10 +1,33 @@
-use crate::error::{Error, Result};
-use crate::state::*;
+use crate::state::PlayerState;
+use crate::{Error, HEIGHT, Result, WIDTH};
+use super::world::TileVec;
+use super::store::{StateStore};
+
+
+impl GameState {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Planning => Self::Resolving,
+            Self::Resolving => Self::Animating,
+            Self::Animating => Self::Resolving,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum GameState {
+    #[default]
+    Planning,
+    Resolving,
+    Animating,
+}
 
 pub struct MatchState {
     turn: u64,
+    user: PlayerState,
     phase: GameState,
-    world: WorldState,
+    world: TileVec,
+    states: StateStore,
 }
 
 impl MatchState {
@@ -20,12 +43,20 @@ impl MatchState {
         self.phase
     }
 
-    pub fn world(&self) -> &WorldState {
+    pub fn world(&self) -> &TileVec {
         &self.world
     }
 
-    pub fn world_mut(&mut self) -> &mut WorldState {
+    pub fn world_mut(&mut self) -> &mut TileVec {
         &mut self.world
+    }
+
+    pub fn state(&self) -> &StateStore {
+        &self.states
+    }
+
+    pub fn state_mut(&mut self) -> &mut StateStore {
+        &mut self.states
     }
 
     pub fn advance_phase(&mut self) -> GameState {
@@ -44,7 +75,9 @@ impl Default for MatchState {
         Self {
             turn: 0,
             phase: GameState::default(),
-            world: WorldState::default(),
+            world: TileVec::with_capacity(WIDTH*HEIGHT),
+            states: StateStore::default(),
+            user: PlayerState::new(),
         }
     }
 }
