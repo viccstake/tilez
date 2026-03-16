@@ -25,10 +25,9 @@ impl From<ShipClass> for VisualSpec {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::{VisualSpec};
+    use super::VisualSpec;
     use game::ShipClass;
 
     fn ship_visual_spec(class: ShipClass) -> VisualSpec {

@@ -1,8 +1,9 @@
-use crate::state::PlayerState;
-use crate::{Error, HEIGHT, Result, WIDTH};
-use super::world::TileVec;
-use super::store::{StateStore};
+use std::collections::{VecDeque};
+use super::world::*;
+use super::order::{self, Order};
 
+
+use crate::{Error, Hex, Result};
 
 impl GameState {
     pub fn next(self) -> Self {
@@ -22,44 +23,46 @@ pub enum GameState {
     Animating,
 }
 
+
 pub struct MatchState {
     turn: u64,
-    user: PlayerState,
-    phase: GameState,
-    world: TileVec,
-    states: StateStore,
+    players: PlayerQueue,               // Action-taking entities to be interleaved when resolving (AI Opponents, Other players, NPCs)
+    phase: GameState,                   // The game exists in discrete phases (turn-based)
+    world: World,                       // The visible and playable world containing the state of each tile, world difficulty is embedded in these parameters
 }
+
+type PlayerQueue = VecDeque<PlayerState>;
 
 impl MatchState {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn turn(&self) -> u64 {
+    pub(crate) fn turn(&self) -> u64 {
         self.turn
     }
 
-    pub fn phase(&self) -> GameState {
+    pub(crate) fn phase(&self) -> GameState {
         self.phase
     }
 
-    pub fn world(&self) -> &TileVec {
+    pub(crate) fn world(&self) -> &World {
         &self.world
     }
 
-    pub fn world_mut(&mut self) -> &mut TileVec {
+    pub(crate) fn world_mut(&mut self) -> &mut World {
         &mut self.world
     }
 
-    pub fn state(&self) -> &StateStore {
-        &self.states
+    pub(crate) fn user(&mut self) -> &mut PlayerState {
+        self.players.front_mut().expect("empty player deck not possible")
     }
 
-    pub fn state_mut(&mut self) -> &mut StateStore {
-        &mut self.states
+    pub(crate) fn users(&mut self) -> impl Iterator<Item = &mut PlayerState> {
+        self.players.iter_mut()
     }
 
-    pub fn advance_phase(&mut self) -> GameState {
+    pub(crate) fn advance_phase(&mut self) -> GameState {
         self.phase = self.phase.next();
         self.phase
     }
@@ -75,10 +78,64 @@ impl Default for MatchState {
         Self {
             turn: 0,
             phase: GameState::default(),
-            world: TileVec::with_capacity(WIDTH*HEIGHT),
-            states: StateStore::default(),
-            user: PlayerState::new(),
+            world: World::default(),
+            players: VecDeque::from(vec![PlayerState::default()])
         }
+    }
+}
+
+pub struct PlayerState {
+    id: u8,
+    gold: u64,
+    orders: Vec<Order>,
+}
+
+impl PlayerState {
+    pub fn new() -> Self {
+        Self {
+            id: 0,
+            gold: 0,
+            orders: vec![],
+        }
+    }
+
+    pub fn with_id(id: u8) -> Self {
+        Self {
+            id,
+            gold: 0,
+            orders: vec![],
+        }
+    }
+
+    pub fn id(&self) -> u8 {
+        self.id
+    }
+
+    pub fn gold(&self) -> u64 {
+        self.gold
+    }
+
+    pub fn submit_order(&mut self, ship_id: u32, action: order::Action) {
+        self.orders.push(Order::from_action(ship_id, action));
+    }
+
+    pub(crate) fn spawn<F, T, P>(&self, f: F, param: P) -> T 
+    where 
+        F: Fn(&Self, P) -> T 
+    {
+        let o = f(self, param);
+        println!("Spawned somthing");
+        return o;
+    }
+
+    pub(crate) fn set_id(&mut self, id: u8) {
+        self.id = id;
+    }
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -86,7 +143,7 @@ impl Default for MatchState {
 mod tests {
     use super::MatchState;
 
-    #[test] 
+    #[test]
     fn match_state_starts_at_zero() {
         let state = MatchState::new();
         assert_eq!(state.turn(), 0);
